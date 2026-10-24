@@ -1,0 +1,96 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        // Jenkins Credentials Store entry (Username with password); exposes POSTGRES_SECRET_USR / POSTGRES_SECRET_PSW
+        POSTGRES_SECRET = credentials('jenkins-postgres-credentials')
+        DB_HOST = 'postgres'
+        DB_PORT = '5432'
+        DB_NAME = 'mydatabase'
+        FRAMEWORK_DIR = 'PyTest DQ Framework'
+    }
+
+    // Configure the job as "Pipeline script from SCM" (Script Path "PyTest DQ Framework/Jenkinsfile");
+    // Jenkins then checks out the repository into the workspace automatically before the stages run.
+    stages {
+        stage('Install System Packages') {
+            steps {
+                sh '''
+                    apt-get update
+                    apt-get install -y libpq-dev gcc python3 python3-dev python3-pip python3-venv
+                '''
+            }
+        }
+        stage('Install Dependencies') {
+            steps {
+                dir("${FRAMEWORK_DIR}") {
+                    sh '''
+                        python3 -m venv venv
+                        . venv/bin/activate
+                        pip install --upgrade pip
+                        pip install -r requirements.txt
+                    '''
+                }
+            }
+        }
+        stage('Run DQ Tests') {
+            steps {
+                dir("${FRAMEWORK_DIR}") {
+                    // Failed checks are data defects: mark the build UNSTABLE and keep going so the report is published
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                        sh '''
+                            . venv/bin/activate
+                            rm -rf html_report
+                            pytest tests -m "parquet_data" \
+                                --db_host="$DB_HOST" \
+                                --db_port="$DB_PORT" \
+                                --db_name="$DB_NAME" \
+                                --db_user="$POSTGRES_SECRET_USR" \
+                                --db_password="$POSTGRES_SECRET_PSW" \
+                                --junitxml=html_report/junit.xml \
+                                --html=html_report/report.html
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Archive Test Report') {
+            steps {
+                // Archive the entire html_report directory, including assets
+                archiveArtifacts artifacts: 'PyTest DQ Framework/html_report/**', allowEmptyArchive: true
+
+                junit testResults: 'PyTest DQ Framework/html_report/junit.xml', allowEmptyResults: true, skipPublishingChecks: true
+
+                // Publish the HTML report
+                publishHTML(target: [
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: 'PyTest DQ Framework/html_report',
+                    reportFiles: 'report.html',
+                    reportName: 'HTML Test Report'
+                ])
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'DQ pipeline execution completed.'
+        }
+        success {
+            echo 'All DQ checks passed.'
+        }
+        unstable {
+            echo 'DQ checks failed. See the HTML Test Report for details.'
+        }
+        failure {
+            echo 'DQ pipeline failed. Please check the logs for details.'
+        }
+    }
+}
